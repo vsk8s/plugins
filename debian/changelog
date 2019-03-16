@@ -1,0 +1,11 @@
+cni-plugins (0.7.5-1) unstable; urgency=medium
+
+  * Port to SOSETH K8S and bump version
+
+ -- Maximilian Falkenstein <maximilian.falkenstein@sos.ethz.ch>  Sat, 16 Mar 2019 23:33:09 +0100
+
+cni-plugins (0.7.3-0) unstable; urgency=medium
+
+  * Initial upload
+
+ -- Maximilian Falkenstein <maximilian.falkenstein@vseth.ethz.ch>  Mon, 03 Sep 2018 10:34:58 +0200

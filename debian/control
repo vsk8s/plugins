@@ -1,0 +1,13 @@
+Source: cni-plugins
+Section: utils
+Priority: optional
+Maintainer: Maximilian Falkenstein <maximilian.falkenstein@sos.ethz.ch>
+Build-Depends: debhelper (>=9), golang-go, binutils
+Standards-Version: 3.9.8
+Vcs-Git: https://github.com/SOSETH/cni-plugins.git
+Vcs-Browser: https://github.com/SOSETH/cni-plugins
+
+Package: cni-plugins
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: cni-plugins contains common CNI network plugins

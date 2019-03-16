@@ -1,0 +1,4 @@
+bin/bridge /opt/cni/bin/
+bin/host-local /opt/cni/bin/
+bin/loopback /opt/cni/bin/
+bin/portmap /opt/cni/bin/
