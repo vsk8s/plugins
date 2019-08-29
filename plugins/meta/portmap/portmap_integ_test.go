@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math/rand"
 	"net"
@@ -27,6 +28,7 @@ import (
 	"github.com/containernetworking/cni/libcni"
 	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/containernetworking/plugins/pkg/testutils"
 	"github.com/coreos/go-iptables/iptables"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -78,7 +80,7 @@ var _ = Describe("portmap integration tests", func() {
 		dirs := filepath.SplitList(os.Getenv("PATH"))
 		cniConf = &libcni.CNIConfig{Path: dirs}
 
-		targetNS, err = ns.NewNS()
+		targetNS, err = testutils.NewNS()
 		Expect(err).NotTo(HaveOccurred())
 		fmt.Fprintln(GinkgoWriter, "namespace:", targetNS.Path())
 
@@ -120,7 +122,7 @@ var _ = Describe("portmap integration tests", func() {
 				return nil
 			}
 			netDeleted = true
-			return cniConf.DelNetworkList(configList, &runtimeConfig)
+			return cniConf.DelNetworkList(context.TODO(), configList, &runtimeConfig)
 		}
 
 		// we'll also manually check the iptables chains
@@ -129,7 +131,7 @@ var _ = Describe("portmap integration tests", func() {
 		dnatChainName := genDnatChain("cni-portmap-unit-test", runtimeConfig.ContainerID).name
 
 		// Create the network
-		resI, err := cniConf.AddNetworkList(configList, &runtimeConfig)
+		resI, err := cniConf.AddNetworkList(context.TODO(), configList, &runtimeConfig)
 		Expect(err).NotTo(HaveOccurred())
 		defer deleteNetwork()
 
