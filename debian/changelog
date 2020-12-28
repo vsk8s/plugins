@@ -1,3 +1,9 @@
+cni-plugins (0.9.0-1) unstable; urgency=medium
+
+  * Bump to upstream release 0.9.0
+
+ -- Maximilian Falkenstein <maximilian.falkenstein@sos.ethz.ch>  Mon, 28 Dec 2020 20:32:49 +0100
+
 cni-plugins (0.8.2-1) unstable; urgency=medium
 
   * Bump version 
