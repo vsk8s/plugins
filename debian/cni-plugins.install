@@ -1,4 +1,17 @@
+bin/bandwidth /opt/cni/bin/
 bin/bridge /opt/cni/bin/
+bin/dhcp /opt/cni/bin/
+bin/firewall /opt/cni/bin/
+bin/flannel /opt/cni/bin/
+bin/host-device /opt/cni/bin/
 bin/host-local /opt/cni/bin/
+bin/ipvlan /opt/cni/bin/
 bin/loopback /opt/cni/bin/
+bin/macvlan /opt/cni/bin/
 bin/portmap /opt/cni/bin/
+bin/ptp /opt/cni/bin/
+bin/sbr /opt/cni/bin/
+bin/static /opt/cni/bin/
+bin/tuning /opt/cni/bin/
+bin/vlan /opt/cni/bin/
+bin/vrf /opt/cni/bin/
