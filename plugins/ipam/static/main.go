@@ -22,8 +22,7 @@ import (
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	types020 "github.com/containernetworking/cni/pkg/types/020"
-	"github.com/containernetworking/cni/pkg/types/current"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
 )
@@ -144,6 +143,9 @@ func LoadIPAMConfig(bytes []byte, envArgs string) (*IPAMConfig, string, error) {
 	if err := json.Unmarshal(bytes, &n); err != nil {
 		return nil, "", err
 	}
+	if n.IPAM == nil {
+		return nil, "", fmt.Errorf("IPAM config missing 'ipam' key")
+	}
 
 	// load IP from CNI_ARGS
 	if envArgs != "" {
@@ -204,10 +206,6 @@ func LoadIPAMConfig(bytes []byte, envArgs string) (*IPAMConfig, string, error) {
 		}
 	}
 
-	if n.IPAM == nil {
-		return nil, "", fmt.Errorf("IPAM config missing 'ipam' key")
-	}
-
 	// Validate all ranges
 	numV4 := 0
 	numV6 := 0
@@ -225,20 +223,16 @@ func LoadIPAMConfig(bytes []byte, envArgs string) (*IPAMConfig, string, error) {
 		}
 
 		if n.IPAM.Addresses[i].Address.IP.To4() != nil {
-			n.IPAM.Addresses[i].Version = "4"
 			numV4++
 		} else {
-			n.IPAM.Addresses[i].Version = "6"
 			numV6++
 		}
 	}
 
 	// CNI spec 0.2.0 and below supported only one v4 and v6 address
 	if numV4 > 1 || numV6 > 1 {
-		for _, v := range types020.SupportedVersions {
-			if n.CNIVersion == v {
-				return nil, "", fmt.Errorf("CNI version %v does not support more than 1 address per family", n.CNIVersion)
-			}
+		if ok, _ := version.GreaterThanOrEqualTo(n.CNIVersion, "0.3.0"); !ok {
+			return nil, "", fmt.Errorf("CNI version %v does not support more than 1 address per family", n.CNIVersion)
 		}
 	}
 
@@ -254,14 +248,16 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	result := &current.Result{}
-	result.DNS = ipamConf.DNS
-	result.Routes = ipamConf.Routes
+	result := &current.Result{
+		CNIVersion: current.ImplementedSpecVersion,
+		DNS:        ipamConf.DNS,
+		Routes:     ipamConf.Routes,
+	}
 	for _, v := range ipamConf.Addresses {
 		result.IPs = append(result.IPs, &current.IPConfig{
-			Version: v.Version,
 			Address: v.Address,
-			Gateway: v.Gateway})
+			Gateway: v.Gateway,
+		})
 	}
 
 	return types.PrintResult(result, confVersion)

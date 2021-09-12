@@ -30,7 +30,7 @@ import (
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/current"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
 
 	"github.com/containernetworking/plugins/pkg/ip"
@@ -42,6 +42,9 @@ import (
 const (
 	sysBusPCI = "/sys/bus/pci/devices"
 )
+
+// Array of different linux drivers bound to network device needed for DPDK
+var userspaceDrivers = []string{"vfio-pci", "uio_pci_generic", "igb_uio"}
 
 //NetConf for host-device config, look the README to learn how to use those parameters
 type NetConf struct {
@@ -90,6 +93,16 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
 	}
 	defer containerNs.Close()
+
+	if len(cfg.PCIAddr) > 0 {
+		isDpdkMode, err := hasDpdkDriver(cfg.PCIAddr)
+		if err != nil {
+			return fmt.Errorf("error with host device: %v", err)
+		}
+		if isDpdkMode {
+			return types.PrintResult(&current.Result{}, cfg.CNIVersion)
+		}
+	}
 
 	hostDev, err := getLink(cfg.Device, cfg.HWAddr, cfg.KernelPath, cfg.PCIAddr)
 	if err != nil {
@@ -167,6 +180,16 @@ func cmdDel(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
 	}
 	defer containerNs.Close()
+
+	if len(cfg.PCIAddr) > 0 {
+		isDpdkMode, err := hasDpdkDriver(cfg.PCIAddr)
+		if err != nil {
+			return fmt.Errorf("error with host device: %v", err)
+		}
+		if isDpdkMode {
+			return nil
+		}
+	}
 
 	if err := moveLinkOut(containerNs, args.IfName); err != nil {
 		return err
@@ -253,6 +276,25 @@ func moveLinkOut(containerNs ns.NetNS, ifName string) error {
 		}
 		return nil
 	})
+}
+
+func hasDpdkDriver(pciaddr string) (bool, error) {
+	driverLink := filepath.Join(sysBusPCI, pciaddr, "driver")
+	driverPath, err := filepath.EvalSymlinks(driverLink)
+	if err != nil {
+		return false, err
+	}
+	driverStat, err := os.Stat(driverPath)
+	if err != nil {
+		return false, err
+	}
+	driverName := driverStat.Name()
+	for _, drv := range userspaceDrivers {
+		if driverName == drv {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func printLink(dev netlink.Link, cniVersion string, containerNs ns.NetNS) error {
