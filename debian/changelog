@@ -1,3 +1,9 @@
+cni-plugins (1.2.0-1) unstable; urgency=medium
+
+  * Bump to upstream release 1.2.0
+
+ -- Maximilian Falkenstein <maximilian.falkenstein@sos.ethz.ch>  Mon, 27 Mar 2023 21:15:30 +0200
+
 cni-plugins (1.0.1-1) unstable; urgency=medium
 
   * Bump to upstream release 1.0.1

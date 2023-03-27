@@ -1,6 +1,6 @@
 variables:
   DISTRIBUTION_VER: "bullseye"
-  CI_APT_PREFIX: "k8s-1.22"
+  CI_APT_PREFIX: "k8s-1.26"
 
 image: docker.git.sos.ethz.ch/isg/debian-ci-base-int:$DISTRIBUTION_VER
 
@@ -12,14 +12,14 @@ build:
   stage: build
   before_script:
     - apt update
-    - apt install -y go-md2man golang-any golang-1.16 rsync binutils bash-completion jq debhelper-compat
-    - export PATH=/usr/lib/go-1.16/bin:$PATH
-    - export GOROOT=/usr/lib/go-1.16
+    - apt install -y go-md2man golang-any golang-1.19 rsync binutils bash-completion jq debhelper-compat
+    - export PATH=/usr/lib/go-1.19/bin:$PATH
+    - export GOROOT=/usr/lib/go-1.19
     - export GOPATH=/root/go
     - rm /usr/bin/go || /bin/true
     - rm /usr/bin/gofmt || /bin/true
-    - ln -s /usr/lib/go-1.16/bin/go /usr/bin/go
-    - ln -s /usr/lib/go-1.16/bin/gofmt /usr/bin/gofmt
+    - ln -s /usr/lib/go-1.19/bin/go /usr/bin/go
+    - ln -s /usr/lib/go-1.19/bin/gofmt /usr/bin/gofmt
   script:
     - gbp buildpackage --git-ignore-branch -b -us -uc
     - mv ../*.deb . # GitLab can't copy from the parent directory...
