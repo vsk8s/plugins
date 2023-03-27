@@ -19,15 +19,15 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 
-	"github.com/j-keck/arping"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
@@ -41,6 +41,8 @@ import (
 )
 
 const defaultDataDir = "/run/cni/tuning"
+const defaultAllowlistDir = "/etc/cni/tuning/"
+const defaultAllowlistFile = "allowlist.conf"
 
 // TuningConf represents the network tuning configuration.
 type TuningConf struct {
@@ -232,7 +234,7 @@ func createBackup(ifName, containerID, backupPath string, tuningConf *TuningConf
 	if err != nil {
 		return fmt.Errorf("failed to marshall data for %q: %v", ifName, err)
 	}
-	if err = ioutil.WriteFile(path.Join(backupPath, containerID+"_"+ifName+".json"), data, 0600); err != nil {
+	if err = os.WriteFile(path.Join(backupPath, containerID+"_"+ifName+".json"), data, 0600); err != nil {
 		return fmt.Errorf("failed to save file %s.json: %v", ifName, err)
 	}
 
@@ -247,7 +249,7 @@ func restoreBackup(ifName, containerID, backupPath string) error {
 		return nil
 	}
 
-	file, err := ioutil.ReadFile(filePath)
+	file, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %q: %v", filePath, err)
 	}
@@ -301,8 +303,19 @@ func restoreBackup(ifName, containerID, backupPath string) error {
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
+	if err := validateSysctlConflictingKeys(args.StdinData); err != nil {
+		return err
+	}
 	tuningConf, err := parseConf(args.StdinData, args.Args)
 	if err != nil {
+		return err
+	}
+
+	if err = validateSysctlConf(tuningConf); err != nil {
+		return err
+	}
+
+	if err = validateArgs(args); err != nil {
 		return err
 	}
 
@@ -315,18 +328,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	result, err := current.NewResultFromResult(tuningConf.PrevResult)
-	if err != nil {
-		return err
-	}
-
 	// The directory /proc/sys/net is per network namespace. Enter in the
 	// network namespace before writing on it.
 
 	err = ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
 		for key, value := range tuningConf.SysCtl {
-			fileName := filepath.Join("/proc/sys", strings.Replace(key, ".", "/", -1))
-			fileName = filepath.Clean(fileName)
+			key = strings.Replace(key, ".", string(os.PathSeparator), -1)
+
+			// If the key contains `IFNAME` - substitute it with args.IfName
+			// to allow setting sysctls on a particular interface, on which
+			// other operations (like mac/mtu setting) are performed
+			key = strings.Replace(key, "IFNAME", args.IfName, 1)
+
+			fileName := filepath.Join("/proc/sys", key)
 
 			// Refuse to modify sysctl parameters that don't belong
 			// to the network subsystem.
@@ -334,7 +348,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 				return fmt.Errorf("invalid net sysctl key: %q", key)
 			}
 			content := []byte(value)
-			err := ioutil.WriteFile(fileName, content, 0644)
+			err := os.WriteFile(fileName, content, 0644)
 			if err != nil {
 				return err
 			}
@@ -349,12 +363,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 		if tuningConf.Mac != "" {
 			if err = changeMacAddr(args.IfName, tuningConf.Mac); err != nil {
 				return err
-			}
-
-			for _, ipc := range result.IPs {
-				if ipc.Address.IP.To4() != nil {
-					_ = arping.GratuitousArpOverIfaceByName(ipc.Address.IP, args.IfName)
-				}
 			}
 
 			updateResultsMacAddr(tuningConf, args.IfName, tuningConf.Mac)
@@ -405,6 +413,9 @@ func main() {
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
+	if err := validateSysctlConflictingKeys(args.StdinData); err != nil {
+		return err
+	}
 	tuningConf, err := parseConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
@@ -428,9 +439,8 @@ func cmdCheck(args *skel.CmdArgs) error {
 		// Check each configured value vs what's currently in the container
 		for key, confValue := range tuningConf.SysCtl {
 			fileName := filepath.Join("/proc/sys", strings.Replace(key, ".", "/", -1))
-			fileName = filepath.Clean(fileName)
 
-			contents, err := ioutil.ReadFile(fileName)
+			contents, err := os.ReadFile(fileName)
 			if err != nil {
 				return err
 			}
@@ -484,5 +494,91 @@ func cmdCheck(args *skel.CmdArgs) error {
 		return err
 	}
 
+	return nil
+}
+
+// Validate the sysctls in the tuning config are on the sysctl allowlist file.
+// Note that if the allowlist file is missing no validation takes place.
+func validateSysctlConf(tuningConf *TuningConf) error {
+	isPresent, allowlist, err := readAllowlist()
+	if err != nil {
+		return err
+	}
+	if !isPresent {
+		return nil
+	}
+	for sysctl, _ := range tuningConf.SysCtl {
+		match, err := contains(sysctl, allowlist)
+		if err != nil {
+			return err
+		}
+		if !match {
+			return errors.New(fmt.Sprintf("Sysctl %s is not allowed. Only the following sysctls are allowed: %+v", sysctl, allowlist))
+		}
+	}
+	return nil
+}
+
+// Validate the allowList contains the given sysctl
+func contains(sysctl string, allowList []string) (bool, error) {
+	for _, allowListElement := range allowList {
+		match, err := regexp.MatchString(allowListElement, sysctl)
+		if err != nil {
+			return false, err
+		}
+		if match {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Read the systctl allowlist from file. Return info if the file is present and the read allowList if it is
+func readAllowlist() (bool, []string, error) {
+	if _, err := os.Stat(filepath.Join(defaultAllowlistDir, defaultAllowlistFile)); os.IsNotExist(err) {
+		return false, nil, nil
+	}
+	dat, err := os.ReadFile(filepath.Join(defaultAllowlistDir, defaultAllowlistFile))
+	if err != nil {
+		return false, nil, err
+	}
+
+	lines := strings.Split(string(dat), "\n")
+	allowList := []string{}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if len(line) > 0 {
+			allowList = append(allowList, line)
+		}
+	}
+	return true, allowList, nil
+}
+
+type sysctlKey string
+
+type sysctlCheck struct {
+	SysCtl map[sysctlKey]string `json:"sysctl"`
+}
+
+var sysctlDuplicatesMap = map[sysctlKey]interface{}{}
+
+func (d *sysctlKey) UnmarshalText(data []byte) error {
+	key := sysctlKey(string(data))
+	if _, exists := sysctlDuplicatesMap[key]; exists {
+		return errors.New("duplicated sysctl keys are not allowed")
+	}
+	sysctlDuplicatesMap[key] = ""
+	return nil
+}
+
+func validateSysctlConflictingKeys(data []byte) error {
+	sysctlCheck := sysctlCheck{}
+	return json.Unmarshal(data, &sysctlCheck)
+}
+
+func validateArgs(args *skel.CmdArgs) error {
+	if strings.Contains(args.IfName, string(os.PathSeparator)) {
+		return errors.New(fmt.Sprintf("Interface name (%s) contains an invalid character %s", args.IfName, string(os.PathSeparator)))
+	}
 	return nil
 }

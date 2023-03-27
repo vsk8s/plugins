@@ -18,13 +18,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
 	"runtime"
 	"syscall"
 	"time"
 
-	"github.com/j-keck/arping"
 	"github.com/vishvananda/netlink"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -33,6 +32,7 @@ import (
 	"github.com/containernetworking/cni/pkg/version"
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ipam"
+	"github.com/containernetworking/plugins/pkg/link"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/utils"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
@@ -55,6 +55,8 @@ type NetConf struct {
 	HairpinMode  bool   `json:"hairpinMode"`
 	PromiscMode  bool   `json:"promiscMode"`
 	Vlan         int    `json:"vlan"`
+	MacSpoofChk  bool   `json:"macspoofchk,omitempty"`
+	EnableDad    bool   `json:"enabledad,omitempty"`
 
 	Args struct {
 		Cni BridgeArgs `json:"cni,omitempty"`
@@ -124,8 +126,8 @@ func loadNetConf(bytes []byte, envArgs string) (*NetConf, string, error) {
 
 // calcGateways processes the results from the IPAM plugin and does the
 // following for each IP family:
-//    - Calculates and compiles a list of gateway addresses
-//    - Adds a default route if needed
+//   - Calculates and compiles a list of gateway addresses
+//   - Adds a default route if needed
 func calcGateways(result *current.Result, n *NetConf) (*gwInfo, *gwInfo, error) {
 
 	gwsV4 := &gwInfo{}
@@ -321,6 +323,11 @@ func ensureVlanInterface(br *netlink.Bridge, vlanId int) (netlink.Link, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to lookup %q: %v", brGatewayIface.Name, err)
 		}
+
+		err = netlink.LinkSetUp(brGatewayVeth)
+		if err != nil {
+			return nil, fmt.Errorf("failed to up %q: %v", brGatewayIface.Name, err)
+		}
 	}
 
 	return brGatewayVeth, nil
@@ -379,10 +386,7 @@ func calcGatewayIP(ipn *net.IPNet) net.IP {
 }
 
 func setupBridge(n *NetConf) (*netlink.Bridge, *current.Interface, error) {
-	vlanFiltering := false
-	if n.Vlan != 0 {
-		vlanFiltering = true
-	}
+	vlanFiltering := n.Vlan != 0
 	// create bridge if necessary
 	br, err := ensureBridge(n.BrName, n.MTU, n.PromiscMode, vlanFiltering)
 	if err != nil {
@@ -393,20 +397,6 @@ func setupBridge(n *NetConf) (*netlink.Bridge, *current.Interface, error) {
 		Name: br.Attrs().Name,
 		Mac:  br.Attrs().HardwareAddr.String(),
 	}, nil
-}
-
-// disableIPV6DAD disables IPv6 Duplicate Address Detection (DAD)
-// for an interface, if the interface does not support enhanced_dad.
-// We do this because interfaces with hairpin mode will see their own DAD packets
-func disableIPV6DAD(ifName string) error {
-	// ehanced_dad sends a nonce with the DAD packets, so that we can safely
-	// ignore ourselves
-	enh, err := ioutil.ReadFile(fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/enhanced_dad", ifName))
-	if err == nil && string(enh) == "1\n" {
-		return nil
-	}
-	f := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", ifName)
-	return ioutil.WriteFile(f, []byte("0"), 0644)
 }
 
 func enableIPForward(family int) error {
@@ -460,6 +450,20 @@ func cmdAdd(args *skel.CmdArgs) error {
 		},
 	}
 
+	if n.MacSpoofChk {
+		sc := link.NewSpoofChecker(hostInterface.Name, containerInterface.Mac, uniqueID(args.ContainerID, args.IfName))
+		if err := sc.Setup(); err != nil {
+			return err
+		}
+		defer func() {
+			if !success {
+				if err := sc.Teardown(); err != nil {
+					fmt.Fprintf(os.Stderr, "%v", err)
+				}
+			}
+		}()
+	}
+
 	if isLayer3 {
 		// run the IPAM plugin and get back the config to apply
 		r, err := ipam.ExecAdd(n.IPAM.Type, args.StdinData)
@@ -482,6 +486,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 		result.IPs = ipamResult.IPs
 		result.Routes = ipamResult.Routes
+		result.DNS = ipamResult.DNS
 
 		if len(result.IPs) == 0 {
 			return errors.New("IPAM plugin returned missing IP config")
@@ -495,56 +500,17 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 		// Configure the container hardware address and IP address(es)
 		if err := netns.Do(func(_ ns.NetNS) error {
-			// Disable IPv6 DAD just in case hairpin mode is enabled on the
-			// bridge. Hairpin mode causes echos of neighbor solicitation
-			// packets, which causes DAD failures.
-			for _, ipc := range result.IPs {
-				if ipc.Address.IP.To4() == nil && (n.HairpinMode || n.PromiscMode) {
-					if err := disableIPV6DAD(args.IfName); err != nil {
-						return err
-					}
-					break
-				}
+			if n.EnableDad {
+				_, _ = sysctl.Sysctl(fmt.Sprintf("/net/ipv6/conf/%s/enhanced_dad", args.IfName), "1")
+				_, _ = sysctl.Sysctl(fmt.Sprintf("net/ipv6/conf/%s/accept_dad", args.IfName), "1")
+			} else {
+				_, _ = sysctl.Sysctl(fmt.Sprintf("net/ipv6/conf/%s/accept_dad", args.IfName), "0")
 			}
+			_, _ = sysctl.Sysctl(fmt.Sprintf("net/ipv4/conf/%s/arp_notify", args.IfName), "1")
 
 			// Add the IP to the interface
 			if err := ipam.ConfigureIface(args.IfName, result); err != nil {
 				return err
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-
-		// check bridge port state
-		retries := []int{0, 50, 500, 1000, 1000}
-		for idx, sleep := range retries {
-			time.Sleep(time.Duration(sleep) * time.Millisecond)
-
-			hostVeth, err := netlink.LinkByName(hostInterface.Name)
-			if err != nil {
-				return err
-			}
-			if hostVeth.Attrs().OperState == netlink.OperUp {
-				break
-			}
-
-			if idx == len(retries)-1 {
-				return fmt.Errorf("bridge port in error state: %s", hostVeth.Attrs().OperState)
-			}
-		}
-
-		// Send a gratuitous arp
-		if err := netns.Do(func(_ ns.NetNS) error {
-			contVeth, err := net.InterfaceByName(args.IfName)
-			if err != nil {
-				return err
-			}
-
-			for _, ipc := range result.IPs {
-				if ipc.Address.IP.To4() != nil {
-					_ = arping.GratuitousArpOverIface(ipc.Address.IP, *contVeth)
-				}
 			}
 			return nil
 		}); err != nil {
@@ -601,7 +567,44 @@ func cmdAdd(args *skel.CmdArgs) error {
 				}
 			}
 		}
+	} else {
+		if err := netns.Do(func(_ ns.NetNS) error {
+			link, err := netlink.LinkByName(args.IfName)
+			if err != nil {
+				return fmt.Errorf("failed to retrieve link: %v", err)
+			}
+			// If layer 2 we still need to set the container veth to up
+			if err = netlink.LinkSetUp(link); err != nil {
+				return fmt.Errorf("failed to set %q up: %v", args.IfName, err)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
+
+	var hostVeth netlink.Link
+
+	// check bridge port state
+	retries := []int{0, 50, 500, 1000, 1000}
+	for idx, sleep := range retries {
+		time.Sleep(time.Duration(sleep) * time.Millisecond)
+
+		hostVeth, err = netlink.LinkByName(hostInterface.Name)
+		if err != nil {
+			return err
+		}
+		if hostVeth.Attrs().OperState == netlink.OperUp {
+			break
+		}
+
+		if idx == len(retries)-1 {
+			return fmt.Errorf("bridge port in error state: %s", hostVeth.Attrs().OperState)
+		}
+	}
+
+	// In certain circumstances, the host-side of the veth may change addrs
+	hostInterface.Mac = hostVeth.Attrs().HardwareAddr.String()
 
 	// Refetch the bridge since its MAC address may change when the first
 	// veth is added or after its IP address is set
@@ -611,16 +614,27 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	brInterface.Mac = br.Attrs().HardwareAddr.String()
 
-	result.DNS = n.DNS
-
 	// Return an error requested by testcases, if any
 	if debugPostIPAMError != nil {
 		return debugPostIPAMError
 	}
 
+	// Use incoming DNS settings if provided, otherwise use the
+	// settings that were already configued by the IPAM plugin
+	if dnsConfSet(n.DNS) {
+		result.DNS = n.DNS
+	}
+
 	success = true
 
 	return types.PrintResult(result, cniVersion)
+}
+
+func dnsConfSet(dnsConf types.DNS) bool {
+	return dnsConf.Nameservers != nil ||
+		dnsConf.Search != nil ||
+		dnsConf.Options != nil ||
+		dnsConf.Domain != ""
 }
 
 func cmdDel(args *skel.CmdArgs) error {
@@ -631,14 +645,17 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	isLayer3 := n.IPAM.Type != ""
 
-	if isLayer3 {
-		if err := ipam.ExecDel(n.IPAM.Type, args.StdinData); err != nil {
-			return err
+	ipamDel := func() error {
+		if isLayer3 {
+			if err := ipam.ExecDel(n.IPAM.Type, args.StdinData); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
 
 	if args.Netns == "" {
-		return nil
+		return ipamDel()
 	}
 
 	// There is a netns so try to clean up. Delete can be called multiple times
@@ -655,7 +672,26 @@ func cmdDel(args *skel.CmdArgs) error {
 	})
 
 	if err != nil {
+		//  if NetNs is passed down by the Cloud Orchestration Engine, or if it called multiple times
+		// so don't return an error if the device is already removed.
+		// https://github.com/kubernetes/kubernetes/issues/43014#issuecomment-287164444
+		_, ok := err.(ns.NSPathNotExistErr)
+		if ok {
+			return ipamDel()
+		}
 		return err
+	}
+
+	// call ipam.ExecDel after clean up device in netns
+	if err := ipamDel(); err != nil {
+		return err
+	}
+
+	if n.MacSpoofChk {
+		sc := link.NewSpoofChecker("", "", uniqueID(args.ContainerID, args.IfName))
+		if err := sc.Teardown(); err != nil {
+			fmt.Fprintf(os.Stderr, "%v", err)
+		}
 	}
 
 	if isLayer3 && n.IPMasq {
@@ -937,4 +973,8 @@ func cmdCheck(args *skel.CmdArgs) error {
 	}
 
 	return nil
+}
+
+func uniqueID(containerID, cniIface string) string {
+	return containerID + "-" + cniIface
 }

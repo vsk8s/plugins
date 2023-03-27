@@ -17,18 +17,18 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"strings"
 
 	"github.com/coreos/go-iptables/iptables"
+	"github.com/networkplumbing/go-nft/nft"
 	"github.com/vishvananda/netlink/nl"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/040"
-	"github.com/containernetworking/cni/pkg/types/100"
+	types040 "github.com/containernetworking/cni/pkg/types/040"
+	types100 "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/testutils"
@@ -44,6 +44,7 @@ const (
 	BRNAME     = "bridge0"
 	BRNAMEVLAN = "bridge0.100"
 	IFNAME     = "eth0"
+	NAMESERVER = "192.0.2.0"
 )
 
 type Net struct {
@@ -65,19 +66,21 @@ type Net struct {
 // testCase defines the CNI network configuration and the expected
 // bridge addresses for a test case.
 type testCase struct {
-	cniVersion string      // CNI Version
-	subnet     string      // Single subnet config: Subnet CIDR
-	gateway    string      // Single subnet config: Gateway
-	ranges     []rangeInfo // Ranges list (multiple subnets config)
-	isGW       bool
-	isLayer2   bool
-	expGWCIDRs []string // Expected gateway addresses in CIDR form
-	vlan       int
-	ipMasq     bool
-	AddErr020  string
-	DelErr020  string
-	AddErr010  string
-	DelErr010  string
+	cniVersion  string      // CNI Version
+	subnet      string      // Single subnet config: Subnet CIDR
+	gateway     string      // Single subnet config: Gateway
+	ranges      []rangeInfo // Ranges list (multiple subnets config)
+	resolvConf  string      // host-local resolvConf file path
+	isGW        bool
+	isLayer2    bool
+	expGWCIDRs  []string // Expected gateway addresses in CIDR form
+	vlan        int
+	ipMasq      bool
+	macspoofchk bool
+	AddErr020   string
+	DelErr020   string
+	AddErr010   string
+	DelErr010   string
 
 	envArgs       string // CNI_ARGS
 	runtimeConfig struct {
@@ -137,6 +140,9 @@ const (
 	ipamDataDirStr = `,
         "dataDir": "%s"`
 
+	ipamResolvConfStr = `,
+		"resolvConf": "%s"`
+
 	ipMasqConfStr = `,
 	"ipMasq": %t`
 
@@ -163,6 +169,9 @@ const (
 
 	ipamEndStr = `
     }`
+
+	macspoofchkFormat = `,
+        "macspoofchk": %t`
 
 	argsFormat = `,
     "args": {
@@ -193,6 +202,9 @@ func (tc testCase) netConfJSON(dataDir string) string {
 	if tc.runtimeConfig.mac != "" {
 		conf += fmt.Sprintf(runtimeConfig, tc.runtimeConfig.mac)
 	}
+	if tc.macspoofchk {
+		conf += fmt.Sprintf(macspoofchkFormat, tc.macspoofchk)
+	}
 
 	if !tc.isLayer2 {
 		conf += netDefault
@@ -206,6 +218,9 @@ func (tc testCase) netConfJSON(dataDir string) string {
 			}
 			if tc.ranges != nil {
 				conf += tc.rangesConfig()
+			}
+			if tc.resolvConf != "" {
+				conf += tc.resolvConfConfig()
 			}
 			conf += ipamEndStr
 		}
@@ -242,6 +257,26 @@ func (tc testCase) rangesConfig() string {
 		}
 	}
 	return conf + rangesEndStr
+}
+
+func (tc testCase) resolvConfConfig() string {
+	conf := fmt.Sprintf(ipamResolvConfStr, tc.resolvConf)
+	return conf
+}
+
+func newResolvConf() (string, error) {
+	f, err := os.CreateTemp("", "host_local_resolv")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	name := f.Name()
+	_, err = f.WriteString(fmt.Sprintf("nameserver %s", NAMESERVER))
+	return name, err
+}
+
+func deleteResolvConf(path string) error {
+	return os.Remove(path)
 }
 
 var counter uint
@@ -361,16 +396,16 @@ func ipVersion(ip net.IP) string {
 
 func countIPAMIPs(path string) (int, error) {
 	count := 0
-	files, err := ioutil.ReadDir(path)
+	entries, err := os.ReadDir(path)
 	if err != nil {
 		return -1, err
 	}
-	for _, file := range files {
-		if file.IsDir() {
+	for _, entry := range entries {
+		if entry.IsDir() {
 			continue
 		}
 
-		if net.ParseIP(file.Name()) != nil {
+		if net.ParseIP(entry.Name()) != nil {
 			count++
 		}
 	}
@@ -555,6 +590,11 @@ func (tester *testerV10x) cmdAddTest(tc testCase, dataDir string) (types.Result,
 		// this check is not relevant for a layer 2 bridge
 		if !tc.isLayer2 && tc.vlan == 0 {
 			Expect(link.Attrs().HardwareAddr.String()).NotTo(Equal(bridgeMAC))
+		}
+
+		// Check that resolvConf was used properly
+		if !tc.isLayer2 && tc.resolvConf != "" {
+			Expect(result.DNS.Nameservers).To(Equal([]string{NAMESERVER}))
 		}
 
 		return nil
@@ -1579,6 +1619,9 @@ var _ = Describe("bridge Operations", func() {
 	var originalNS, targetNS ns.NetNS
 	var dataDir string
 
+	resolvConf, err := newResolvConf()
+	Expect(err).NotTo(HaveOccurred())
+
 	BeforeEach(func() {
 		// Create a new NetNS so we don't modify the host
 		var err error
@@ -1587,7 +1630,7 @@ var _ = Describe("bridge Operations", func() {
 		targetNS, err = testutils.NewNS()
 		Expect(err).NotTo(HaveOccurred())
 
-		dataDir, err = ioutil.TempDir("", "bridge_test")
+		dataDir, err = os.MkdirTemp("", "bridge_test")
 		Expect(err).NotTo(HaveOccurred())
 
 		// Do not emulate an error, each test will set this if needed
@@ -1600,6 +1643,10 @@ var _ = Describe("bridge Operations", func() {
 		Expect(testutils.UnmountNS(originalNS)).To(Succeed())
 		Expect(targetNS.Close()).To(Succeed())
 		Expect(testutils.UnmountNS(targetNS)).To(Succeed())
+	})
+
+	AfterSuite(func() {
+		deleteResolvConf(resolvConf)
 	})
 
 	for _, ver := range testutils.AllSpecVersions {
@@ -1697,6 +1744,12 @@ var _ = Describe("bridge Operations", func() {
 				DelErr020: "CNI version 0.2.0 does not support more than 1 address per family",
 				AddErr010: "CNI version 0.1.0 does not support more than 1 address per family",
 				DelErr010: "CNI version 0.1.0 does not support more than 1 address per family",
+			},
+			{
+				// with resolvConf DNS settings
+				subnet:     "10.1.2.0/24",
+				expGWCIDRs: []string{"10.1.2.1/24"},
+				resolvConf: resolvConf,
 			},
 		} {
 			tc := tc
@@ -2175,6 +2228,35 @@ var _ = Describe("bridge Operations", func() {
 				})
 			}
 		}
+
+		It(fmt.Sprintf("[%s] configures mac spoof-check (no mac spoofing)", ver), func() {
+			Expect(originalNS.Do(func(ns.NetNS) error {
+				defer GinkgoRecover()
+
+				tc := testCase{
+					cniVersion:  ver,
+					subnet:      "10.1.2.0/24",
+					macspoofchk: true,
+				}
+				args := tc.createCmdArgs(originalNS, dataDir)
+				_, _, err := testutils.CmdAddWithArgs(args, func() error {
+					return cmdAdd(args)
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				assertMacSpoofCheckRulesExist()
+
+				Expect(testutils.CmdDelWithArgs(args, func() error {
+					if err := cmdDel(args); err != nil {
+						return err
+					}
+					assertMacSpoofCheckRulesMissing()
+					return nil
+				})).To(Succeed())
+
+				return nil
+			})).To(Succeed())
+		})
 	}
 
 	It("check vlan id when loading net conf", func() {
@@ -2211,3 +2293,50 @@ var _ = Describe("bridge Operations", func() {
 		}
 	})
 })
+
+func assertMacSpoofCheckRulesExist() {
+	assertMacSpoofCheckRules(
+		func(actual interface{}, expectedLen int) {
+			ExpectWithOffset(3, actual).To(HaveLen(expectedLen))
+		})
+}
+
+func assertMacSpoofCheckRulesMissing() {
+	assertMacSpoofCheckRules(
+		func(actual interface{}, _ int) {
+			ExpectWithOffset(3, actual).To(BeEmpty())
+		})
+}
+
+func assertMacSpoofCheckRules(assert func(actual interface{}, expectedLen int)) {
+	c, err := nft.ReadConfig()
+	ExpectWithOffset(2, err).NotTo(HaveOccurred())
+
+	expectedTable := nft.NewTable("nat", "bridge")
+	filter := nft.TypeFilter
+	hook := nft.HookPreRouting
+	prio := -300
+	policy := nft.PolicyAccept
+	expectedBaseChain := nft.NewChain(expectedTable, "PREROUTING", &filter, &hook, &prio, &policy)
+
+	assert(c.LookupRule(nft.NewRule(
+		expectedTable,
+		expectedBaseChain,
+		nil, nil, nil,
+		"macspoofchk-dummy-0-eth0",
+	)), 1)
+
+	assert(c.LookupRule(nft.NewRule(
+		expectedTable,
+		nft.NewRegularChain(expectedTable, "cni-br-iface-dummy-0-eth0"),
+		nil, nil, nil,
+		"macspoofchk-dummy-0-eth0",
+	)), 1)
+
+	assert(c.LookupRule(nft.NewRule(
+		expectedTable,
+		nft.NewRegularChain(expectedTable, "cni-br-iface-dummy-0-eth0-mac"),
+		nil, nil, nil,
+		"macspoofchk-dummy-0-eth0",
+	)), 2)
+}
